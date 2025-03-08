@@ -1,0 +1,19 @@
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "app_icon.png"
+  adaptive_icon_background: "#FE7D48" # Coral background
+  adaptive_icon_foreground: "app_icon.png"
+  remove_alpha_ios: true
+  web:
+    generate: true
+    image_path: "app_icon.png"
+    background_color: "#FE7D48"
+    theme_color: "#FE7D48"
+  windows:
+    generate: true
+    image_path: "app_icon.png"
+    icon_size: 48 # min:48, max:256, default: 48
+  macos:
+    generate: true
+    image_path: "app_icon.png" 
