@@ -79,9 +79,13 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isSpeaking = false;
   int _silenceCount = 0;
   static const int _silenceThreshold =
-      8; // Number of silent chunks to trigger segment end (reduced for better responsiveness)
+      10; // Number of silent chunks to trigger segment end (increased for better segment separation)
   static const double _audioThreshold =
-      0.015; // Threshold for audio level to detect speech (slightly reduced)
+      0.01; // Threshold for audio level to detect speech (reduced for better sensitivity)
+
+  // Audio buffer to store recent audio data
+  final List<Uint8List> _audioBuffer = [];
+  static const int _bufferMaxSize = 8; // Store recent 8 audio chunks (about 640ms of audio)
 
   // For segment recording
   bool _isRecordingSegment = false;
@@ -97,28 +101,25 @@ class _ChatScreenState extends State<ChatScreen> {
   // For playing audio
   String? _currentPlayingPath;
 
+  // For pausing recording while AI is responding
+  bool _wasRecordingBeforeAIResponse = false;
+  bool _shouldResumeRecordingAfterAI = false;
+  bool _isAIResponding = false; // Track if AI is currently responding
+
   @override
   void initState() {
     super.initState();
-    _audioService.init();
     _loadSavedMessages();
-    _storageService.getApiKey('google').then((apiKey) {
-      _storageService.getAccent().then((accentCode) {
-        debugPrint('accentCode: $accentCode');
-        debugPrint('apiKey: $apiKey');
-        if (accentCode != null && apiKey != null) {
-          debugPrint('Connecting to Gemini');
-          _geminiService.connect(apiKey, accentCode);
-        }
-      });
-    });
+    _initializeServices();
+
+    // Listen to Gemini connection status
     _geminiService.connectionStream.listen((isConnected) {
-      debugPrint('isConnected: $isConnected');
       setState(() {
         _isConnected = isConnected;
       });
     });
 
+    // Listen to audio responses from Gemini
     _geminiService.audioResponses.listen((audioData) {
       debugPrint('Received audio data: ${audioData.length} bytes');
       _collectAudioChunk(audioData);
@@ -129,6 +130,11 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() {
         _isPlaying = isPlaying;
       });
+      
+      // If playback stopped and we should resume recording
+      if (!isPlaying && _shouldResumeRecordingAfterAI) {
+        _resumeRecordingAfterAIResponse();
+      }
     });
   }
 
@@ -176,6 +182,16 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_isCollectingResponse) {
       _isCollectingResponse = true;
       _currentResponseChunks.clear();
+      
+      // Update UI to show AI is responding
+      setState(() {
+        _isAIResponding = true;
+      });
+      
+      // Pause recording when AI starts responding
+      if (_isRecording && _isRecordingSegment) {
+        _pauseRecordingForAIResponse();
+      }
     }
 
     // Add new audio chunk
@@ -188,12 +204,40 @@ class _ChatScreenState extends State<ChatScreen> {
       _finalizeAndPlayResponse();
     });
   }
+  
+  // Pause recording while AI is responding
+  void _pauseRecordingForAIResponse() {
+    debugPrint('Pausing recording for AI response');
+    // Save current recording state
+    _wasRecordingBeforeAIResponse = _isRecordingSegment;
+    
+    // Update UI to show AI is responding
+    setState(() {
+      _isAIResponding = true;
+    });
+    
+    // Finalize current segment if any
+    if (_isRecordingSegment && _currentSegmentData.isNotEmpty) {
+      _finalizeSegment();
+    }
+    
+    // Temporarily stop the recorder to prevent capturing AI audio
+    _audioService.stopRecorder();
+    
+    // We'll restart recording when AI response is done
+    // but keep _isRecording true so the UI shows we're still in recording mode
+  }
 
   // Finalize response collection and play
   Future<void> _finalizeAndPlayResponse() async {
     if (_currentResponseChunks.isEmpty) return;
 
     try {
+      // Make sure recording is paused before playing AI response
+      if (_isRecording) {
+        _pauseRecordingForAIResponse();
+      }
+      
       // Merge all audio chunks
       final totalLength = _currentResponseChunks.fold<int>(
         0,
@@ -209,10 +253,10 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       // Save merged audio to file
-      final tempDir = await getTemporaryDirectory();
+      final dirPath = await _audioService.getAudioDirectoryPath();
       final fileName =
           'ai_response_${DateTime.now().millisecondsSinceEpoch}.wav';
-      final filePath = '${tempDir.path}/$fileName';
+      final filePath = '$dirPath/$fileName';
 
       final file = File(filePath);
       await file.writeAsBytes(mergedAudio);
@@ -233,9 +277,17 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _isPlaying = true;
         });
+        
+        // Set a flag to resume recording after playback finishes
+        _shouldResumeRecordingAfterAI = _isRecording;
       }
     } catch (e) {
       debugPrint('Error processing audio response: $e');
+      
+      // If there was an error, resume recording if needed
+      if (_isRecording) {
+        _resumeRecordingAfterAIResponse();
+      }
     } finally {
       // Reset state
       _isCollectingResponse = false;
@@ -288,6 +340,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _segmentCount = 0;
     _currentSegmentData.clear();
     _isRecordingSegment = false;
+    _audioBuffer.clear(); // Clear audio buffer
 
     await _audioService.startStreamPlayer();
 
@@ -296,15 +349,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _detectVoiceActivity(level);
     });
 
-    await _audioService.startRecordingStream((data) {
-      // Add data to current segment if we're recording a segment
-      if (_isRecordingSegment) {
-        _currentSegmentData.add(data);
-      }
-
-      // Always send data to Gemini for real-time processing
-      _geminiService.sendAudio(data);
-    }, 'user');
+    await _startRecordingStream();
 
     setState(() {
       _isRecording = true;
@@ -324,9 +369,38 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     });
   }
+  
+  // Start recording stream - extracted to a separate method so we can restart it
+  Future<void> _startRecordingStream() async {
+    await _audioService.startRecordingStream((data) {
+      // Add data to audio buffer
+      _addToAudioBuffer(data);
+      
+      // Add data to current segment if we're recording a segment
+      if (_isRecordingSegment) {
+        _currentSegmentData.add(data);
+      }
+
+      // Always send data to Gemini for real-time processing
+      _geminiService.sendAudio(data);
+    }, 'user');
+  }
+
+  // Add audio data to buffer and maintain maximum buffer size
+  void _addToAudioBuffer(Uint8List data) {
+    _audioBuffer.add(data);
+    while (_audioBuffer.length > _bufferMaxSize) {
+      _audioBuffer.removeAt(0);
+    }
+  }
 
   void _detectVoiceActivity(double level) {
     if (!_isRecording) return;
+    
+    // Don't start new segments if AI is responding or playing
+    if (_isCollectingResponse || (_isPlaying && _shouldResumeRecordingAfterAI)) {
+      return;
+    }
 
     if (level > _audioThreshold) {
       // Voice detected
@@ -338,16 +412,15 @@ class _ChatScreenState extends State<ChatScreen> {
           _startNewSegment();
         }
       }
+      // Reset silence counter
       _silenceCount = 0;
     } else {
-      // Silence detected
+      // No voice detected, increment silence counter
       if (_isSpeaking) {
         _silenceCount++;
-        if (_silenceCount % 2 == 0) {
-          // Only log every other count to reduce spam
-          debugPrint(
-            'VAD: Silence detected, count: $_silenceCount / $_silenceThreshold',
-          );
+        if (_silenceCount >= _silenceThreshold) {
+          debugPrint('VAD: Speech ended, silence for $_silenceCount frames');
+          _isSpeaking = false;
         }
       }
     }
@@ -356,6 +429,13 @@ class _ChatScreenState extends State<ChatScreen> {
   void _startNewSegment() {
     _isRecordingSegment = true;
     _currentSegmentData = [];
+    
+    // Add buffered audio data to the beginning of the new segment
+    if (_audioBuffer.isNotEmpty) {
+      debugPrint('Adding ${_audioBuffer.length} buffered audio chunks to new segment');
+      _currentSegmentData.addAll(_audioBuffer);
+    }
+    
     _segmentCount++;
     debugPrint('Starting new segment: $_segmentCount');
   }
@@ -364,7 +444,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_currentSegmentData.isEmpty) return;
 
     try {
-      debugPrint('Finalizing segment: $_segmentCount');
+      debugPrint('Finalizing segment: $_segmentCount with ${_currentSegmentData.length} chunks');
 
       // Merge all segment data
       final totalLength = _currentSegmentData.fold<int>(
@@ -383,9 +463,9 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       // Save segment to file
-      final tempDir = await getTemporaryDirectory();
+      final dirPath = await _audioService.getAudioDirectoryPath();
       final fileName = 'segment_${DateTime.now().millisecondsSinceEpoch}.pcm';
-      final filePath = '${tempDir.path}/$fileName';
+      final filePath = '$dirPath/$fileName';
 
       final file = File(filePath);
       await file.writeAsBytes(mergedAudio);
@@ -408,10 +488,19 @@ class _ChatScreenState extends State<ChatScreen> {
       // Reset for next segment
       _isRecordingSegment = false;
       _currentSegmentData = [];
-      _silenceCount = 0;
-
-      // Reset speaking state to allow detection of next segment
-      _isSpeaking = false;
+      
+      // Don't immediately reset silence count to allow time for system to detect next segment
+      // This helps prevent segments from being too close together
+      // _silenceCount = 0;
+      
+      // Delay resetting speaking state to avoid immediately starting a new segment
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (_isRecording) {
+          _isSpeaking = false;
+          _silenceCount = 0;
+          debugPrint('Reset speaking state, ready for next segment');
+        }
+      });
 
       debugPrint('Segment $_segmentCount finalized and ready for next segment');
     } catch (e) {
@@ -451,6 +540,17 @@ class _ChatScreenState extends State<ChatScreen> {
       final bool isPcm = message.audioPath!.endsWith('.pcm');
       final int sampleRate = isPcm ? 16000 : (message.isUser ? 16000 : 24000);
 
+      // If this is an AI message, pause recording if needed
+      if (!message.isUser && _isRecording) {
+        // Update UI to show AI is responding
+        setState(() {
+          _isAIResponding = true;
+        });
+        
+        _pauseRecordingForAIResponse();
+        _shouldResumeRecordingAfterAI = true;
+      }
+
       // Play audio file
       await _audioService.playAudio(message.audioPath!, sampleRate);
       _audioSubscription = _audioService.playbackStatus.listen((isPlaying) {
@@ -458,12 +558,26 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _isPlaying = isPlaying;
         });
+        
+        // If playback stopped and we should resume recording
+        if (!isPlaying && _shouldResumeRecordingAfterAI) {
+          _resumeRecordingAfterAIResponse();
+        }
       });
     } catch (e) {
       debugPrint('Error playing message audio: $e');
       setState(() {
         _isPlaying = false;
+        // Reset AI responding state if there was an error
+        if (_shouldResumeRecordingAfterAI) {
+          _isAIResponding = false;
+        }
       });
+      
+      // If there was an error, resume recording if needed
+      if (_shouldResumeRecordingAfterAI) {
+        _resumeRecordingAfterAIResponse();
+      }
     }
   }
 
@@ -634,13 +748,15 @@ class _ChatScreenState extends State<ChatScreen> {
                     padding: const EdgeInsets.only(top: 12.0),
                     child: Text(
                       _isRecording
-                          ? appLocalizations.translate(
-                            _isSpeaking
-                                ? 'segment_recording'
-                                : _isRecordingSegment
-                                ? 'segment_paused'
-                                : 'recording_in_progress',
-                          )
+                          ? _isAIResponding
+                              ? appLocalizations.translate('ai_responding')
+                              : appLocalizations.translate(
+                                _isSpeaking
+                                    ? 'segment_recording'
+                                    : _isRecordingSegment
+                                    ? 'segment_paused'
+                                    : 'recording_in_progress',
+                              )
                           : _isProcessing
                           ? appLocalizations.translate('processing')
                           : _isPlaying
@@ -649,9 +765,12 @@ class _ChatScreenState extends State<ChatScreen> {
                       style: TextStyle(
                         color:
                             _isRecording
-                                ? theme.colorScheme.error
+                                ? _isAIResponding
+                                    ? theme.colorScheme.secondary
+                                    : theme.colorScheme.error
                                 : theme.colorScheme.primary,
                         fontSize: 13.0,
+                        fontWeight: _isAIResponding ? FontWeight.bold : FontWeight.normal,
                       ),
                     ),
                   ),
@@ -901,5 +1020,57 @@ class _ChatScreenState extends State<ChatScreen> {
       _messages.clear();
     });
     await _storageService.clearChatMessages();
+  }
+
+  // Resume recording after AI response
+  void _resumeRecordingAfterAIResponse() {
+    if (!_isRecording) return; // Don't resume if recording was stopped
+    
+    debugPrint('Resuming recording after AI response');
+    
+    // Update UI to show AI is no longer responding
+    setState(() {
+      _isAIResponding = false;
+    });
+    
+    // Reset segment data
+    _currentSegmentData = [];
+    
+    // Reset VAD state
+    _isSpeaking = false;
+    _silenceCount = 0;
+    
+    // Wait a short delay before resuming to avoid capturing any residual audio
+    Future.delayed(const Duration(milliseconds: 500), () async {
+      if (_isRecording) {
+        // Restart the recording stream
+        await _startRecordingStream();
+        
+        // Reset flags
+        _wasRecordingBeforeAIResponse = false;
+        _shouldResumeRecordingAfterAI = false;
+        
+        debugPrint('Recording resumed, waiting for speech');
+      }
+    });
+  }
+
+  // Initialize services
+  void _initializeServices() {
+    _audioService.init();
+    
+    // Clean up old recordings (older than 30 days)
+    _audioService.cleanupOldRecordings();
+    
+    _storageService.getApiKey('google').then((apiKey) {
+      _storageService.getAccent().then((accentCode) {
+        debugPrint('accentCode: $accentCode');
+        debugPrint('apiKey: $apiKey');
+        if (accentCode != null && apiKey != null) {
+          debugPrint('Connecting to Gemini');
+          _geminiService.connect(apiKey, accentCode);
+        }
+      });
+    });
   }
 }

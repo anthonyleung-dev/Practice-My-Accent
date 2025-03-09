@@ -107,6 +107,7 @@
   "voice_segment": "Voice segment",
   "voice_segment_with_number": "Voice segment {number}",
   "ai_voice_message": "AI voice response",
+  "ai_responding": "AI is responding... (recording paused)",
   "playing": "Playing...",
   "start_talking_to_teacher": "Start talking to your teacher",
   "stop_talking_to_teacher": "Stop talking to your teacher",

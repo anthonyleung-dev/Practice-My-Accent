@@ -105,6 +105,7 @@
   "voice_segment": "语音段落",
   "voice_segment_with_number": "语音段落 {number}",
   "ai_voice_message": "AI 语音回复",
+  "ai_responding": "AI 正在回复... (录音已暂停)",
   "playing": "播放中...",
   "start_talking_to_teacher": "开始与您的老师对话",
   "stop_talking_to_teacher": "停止与老师对话",
